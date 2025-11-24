@@ -167,6 +167,41 @@ All commands use the prefix set in your `.env` file (default is `.`):
   - Bot mode (Public/Private)
   - Connection status
 
+### Group Management Commands:
+
+- **`.add <number>`** - Add a member to the group
+  - Admin only (owner can bypass)
+  - Example: `.add 2349012345678`
+
+- **`.kick`** - Remove a member from the group
+  - Admin only (owner can bypass)
+  - Reply to a message with `.kick` or use `.kick <number>`
+
+- **`.promote`** - Promote a member to admin
+  - Admin only (owner can bypass)
+  - Reply to a message with `.promote` or use `.promote <number>`
+
+- **`.demote`** - Demote an admin to member
+  - Admin only (owner can bypass)
+  - Reply to a message with `.demote` or use `.demote <number>`
+
+- **`.tag <message>`** - Tag all members with a message
+  - No admin requirement in public mode
+  - Owner can always use
+
+- **`.tagall`** - List all members with tags
+  - No admin requirement in public mode
+  - Owner can always use
+
+- **`.mute [minutes]`** - Mute the group
+  - Admin only (owner can bypass)
+  - `.mute` - Mutes indefinitely
+  - `.mute 30` - Mutes for 30 minutes then auto-unmutes
+
+- **`.unmute`** - Unmute the group
+  - Admin only (owner can bypass)
+  - Cancels any active auto-unmute timer
+
 ### Command Examples:
 
 ```
@@ -175,12 +210,27 @@ All commands use the prefix set in your `.env` file (default is `.`):
 .help
 .help menu
 .session
+.add 2349012345678
+.kick (reply to message)
+.promote (reply to message)
+.tag Hello everyone!
+.mute 30
+.unmute
 ```
 
-### Private Mode:
+### Permission System:
 
-When `BOT_MODE=private` in `.env`:
-- Only the owner (OWNER_NUMBER) can use commands
+**Bot Owner (OWNER_NUMBER in .env):**
+- Can use ALL commands regardless of bot mode
+- Bypasses all admin checks
+
+**Public Mode (BOT_MODE=public):**
+- Everyone can use general commands: `.menu`, `.ping`, `.help`, `.session`, `.tag`, `.tagall`
+- Only group admins can use: `.add`, `.kick`, `.promote`, `.demote`, `.mute`, `.unmute`
+- Owner can always use all commands
+
+**Private Mode (BOT_MODE=private):**
+- Only the owner can use all commands
 - Other users' commands are silently ignored
 - Console shows unauthorized access attempts
 
@@ -228,10 +278,10 @@ Note: This will delete the old `auth_info_baileys` folder if it exists (from old
 
 ## Adding Custom Commands
 
-You can easily add your own commands! Edit [index.js](index.js) and add new commands after line 243:
+You can easily add your own commands! Edit [index.js](index.js) and add new commands after the existing commands:
 
 ```javascript
-// Add your custom command
+// Simple command
 registerCommand('mycommand', 'Description of my command', async (sock, msg, args) => {
     await sock.sendMessage(msg.key.remoteJid, {
         text: '🎉 My custom response!'
@@ -245,6 +295,36 @@ registerCommand('echo', 'Echo back your message', async (sock, msg, args) => {
         text: `📢 You said: ${text}`
     });
 });
+
+// Admin-only command (owner can bypass)
+registerCommand('admincmd', 'Admin only command', async (sock, msg, args) => {
+    if (!isGroup(msg.key.remoteJid)) {
+        return await sock.sendMessage(msg.key.remoteJid, {
+            text: '❌ This command is only for groups!'
+        });
+    }
+
+    const senderNumber = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+    const isOwner = senderNumber === config.ownerNumber;
+
+    if (!isOwner) {
+        if (config.botMode === 'private') {
+            return await sock.sendMessage(msg.key.remoteJid, {
+                text: '❌ This command is restricted to bot owner in private mode!'
+            });
+        }
+
+        if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant))) {
+            return await sock.sendMessage(msg.key.remoteJid, {
+                text: '❌ Only admins can use this command!'
+            });
+        }
+    }
+
+    await sock.sendMessage(msg.key.remoteJid, {
+        text: '✅ Admin command executed!'
+    });
+});
 ```
 
 Your commands will automatically:
@@ -252,6 +332,7 @@ Your commands will automatically:
 - Work with `.help`
 - Respect public/private mode
 - Use your configured prefix
+- Support owner bypass for admin commands
 
 ## Dependencies
 
@@ -309,6 +390,18 @@ Your commands will automatically:
 - Commands must start with prefix: `.menu` not just `menu`
 - Check console logs - you should see: `⚡ Executing command: .menu`
 - If in private mode, ensure your number matches OWNER_NUMBER in .env
+
+**Admin commands not working:**
+- ✅ Fixed! Commands now check if USER is admin, not bot
+- Unlike Telegram, WhatsApp doesn't have "bot admin" concept
+- Bot owner (OWNER_NUMBER) can bypass all admin checks
+- In public mode: group admins can use `.add`, `.kick`, `.promote`, `.demote`, `.mute`, `.unmute`
+- In private mode: only bot owner can use commands
+
+**Group commands (.mute, .unmute, .add, etc.) failing:**
+- Make sure you're using these commands in a group chat
+- Ensure you have admin permissions in the group (or you're the bot owner)
+- Check that the bot is still connected (use `.ping` to test)
 
 **Multiple sessions not working:**
 - Make sure each session has a unique name

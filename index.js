@@ -26,6 +26,9 @@ const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 // Command Registry
 const commands = new Map();
 
+// Mute timers storage
+const muteTimers = new Map();
+
 function registerCommand(name, description, handler) {
     commands.set(name, { description, handler });
 }
@@ -243,19 +246,6 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
     // Helper function to check if chat is a group
     const isGroup = (jid) => jid.endsWith('@g.us');
 
-    // Helper function to check if bot is admin
-    const isBotAdmin = async (sock, groupJid) => {
-        try {
-            const groupMetadata = await sock.groupMetadata(groupJid);
-            const botNumber = sock.user.id.split(':')[0];
-            const botJid = botNumber + '@s.whatsapp.net';
-            const participant = groupMetadata.participants.find(p => p.id === botJid);
-            return participant?.admin === 'admin' || participant?.admin === 'superadmin';
-        } catch {
-            return false;
-        }
-    };
-
     // Helper function to check if user is admin
     const isUserAdmin = async (sock, groupJid, userJid) => {
         try {
@@ -265,6 +255,44 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
         } catch {
             return false;
         }
+    };
+
+    // Reusable permission checker for admin commands
+    const checkAdminPermission = async (sock, msg) => {
+        // Check if it's a group
+        if (!isGroup(msg.key.remoteJid)) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: '❌ This command is only for groups!'
+            });
+            return { allowed: false };
+        }
+
+        // Get sender number
+        const senderNumber = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+        const isOwner = senderNumber === config.ownerNumber;
+
+        // Owner can bypass all checks
+        if (isOwner) {
+            return { allowed: true, isOwner: true };
+        }
+
+        // Check bot mode
+        if (config.botMode === 'private') {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: '❌ This command is restricted to bot owner in private mode!'
+            });
+            return { allowed: false };
+        }
+
+        // Check if user is admin
+        if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant))) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: '❌ Only admins can use this command!'
+            });
+            return { allowed: false };
+        }
+
+        return { allowed: true, isOwner: false };
     };
 
     // Register Commands
@@ -293,6 +321,8 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
 │ ${config.prefix}demote
 │ ${config.prefix}tag
 │ ${config.prefix}tagall
+│ ${config.prefix}mute
+│ ${config.prefix}unmute
 ╰──────────────────────╯
 
 ╭──────────────────────╮
@@ -352,28 +382,40 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             });
         }
 
-        if (!(await isBotAdmin(sock, msg.key.remoteJid))) {
-            return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Bot is not admin! Please make the bot admin first.'
-            });
-        }
+        // Get sender number
+        const senderNumber = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+        const isOwner = senderNumber === config.ownerNumber;
 
-        if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant || msg.key.remoteJid))) {
-            return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Only admins can use this command!'
-            });
+        // Check if user is admin (owner can bypass in any mode)
+        if (!isOwner) {
+            if (config.botMode === 'private') {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ This command is restricted to bot owner in private mode!'
+                });
+            }
+
+            if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant))) {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ Only admins can use this command!'
+                });
+            }
         }
 
         if (args.length === 0) {
             return await sock.sendMessage(msg.key.remoteJid, {
-                text: `❌ Usage: ${config.prefix}add <number>\n\nExample: ${config.prefix}add 2349012345678`
+                text: `📖 *How to use ${config.prefix}add*\n\n` +
+                      `*Description:* Add a member to the group\n\n` +
+                      `*Usage:* ${config.prefix}add <number>\n\n` +
+                      `*Example:*\n${config.prefix}add 2349012345678\n\n` +
+                      `💡 Include country code without + or spaces`
             });
         }
 
         const number = args[0].replace(/[^0-9]/g, '');
         if (!number) {
             return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Please provide a valid phone number!'
+                text: `❌ Please provide a valid phone number!\n\n` +
+                      `*Example:* ${config.prefix}add 2349012345678`
             });
         }
 
@@ -396,16 +438,23 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             });
         }
 
-        if (!(await isBotAdmin(sock, msg.key.remoteJid))) {
-            return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Bot is not admin! Please make the bot admin first.'
-            });
-        }
+        // Get sender number
+        const senderNumber = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+        const isOwner = senderNumber === config.ownerNumber;
 
-        if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant || msg.key.remoteJid))) {
-            return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Only admins can use this command!'
-            });
+        // Check if user is admin (owner can bypass in any mode)
+        if (!isOwner) {
+            if (config.botMode === 'private') {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ This command is restricted to bot owner in private mode!'
+                });
+            }
+
+            if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant))) {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ Only admins can use this command!'
+                });
+            }
         }
 
         let targetJid;
@@ -418,7 +467,14 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             targetJid = `${number}@s.whatsapp.net`;
         } else {
             return await sock.sendMessage(msg.key.remoteJid, {
-                text: `❌ Usage: Reply to a message with ${config.prefix}kick or use ${config.prefix}kick <number>`
+                text: `📖 *How to use ${config.prefix}kick*\n\n` +
+                      `*Description:* Remove a member from the group\n\n` +
+                      `*Usage:*\n` +
+                      `• Reply to their message with ${config.prefix}kick\n` +
+                      `• Or use ${config.prefix}kick <number>\n\n` +
+                      `*Examples:*\n` +
+                      `1. Reply to someone's message: ${config.prefix}kick\n` +
+                      `2. ${config.prefix}kick 2349012345678`
             });
         }
 
@@ -442,16 +498,23 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             });
         }
 
-        if (!(await isBotAdmin(sock, msg.key.remoteJid))) {
-            return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Bot is not admin! Please make the bot admin first.'
-            });
-        }
+        // Get sender number
+        const senderNumber = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+        const isOwner = senderNumber === config.ownerNumber;
 
-        if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant || msg.key.remoteJid))) {
-            return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Only admins can use this command!'
-            });
+        // Check if user is admin (owner can bypass in any mode)
+        if (!isOwner) {
+            if (config.botMode === 'private') {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ This command is restricted to bot owner in private mode!'
+                });
+            }
+
+            if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant))) {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ Only admins can use this command!'
+                });
+            }
         }
 
         let targetJid;
@@ -464,7 +527,14 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             targetJid = `${number}@s.whatsapp.net`;
         } else {
             return await sock.sendMessage(msg.key.remoteJid, {
-                text: `❌ Usage: Reply to a message with ${config.prefix}promote or use ${config.prefix}promote <number>`
+                text: `📖 *How to use ${config.prefix}promote*\n\n` +
+                      `*Description:* Promote a member to admin\n\n` +
+                      `*Usage:*\n` +
+                      `• Reply to their message with ${config.prefix}promote\n` +
+                      `• Or use ${config.prefix}promote <number>\n\n` +
+                      `*Examples:*\n` +
+                      `1. Reply to someone's message: ${config.prefix}promote\n` +
+                      `2. ${config.prefix}promote 2349012345678`
             });
         }
 
@@ -488,16 +558,23 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             });
         }
 
-        if (!(await isBotAdmin(sock, msg.key.remoteJid))) {
-            return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Bot is not admin! Please make the bot admin first.'
-            });
-        }
+        // Get sender number
+        const senderNumber = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+        const isOwner = senderNumber === config.ownerNumber;
 
-        if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant || msg.key.remoteJid))) {
-            return await sock.sendMessage(msg.key.remoteJid, {
-                text: '❌ Only admins can use this command!'
-            });
+        // Check if user is admin (owner can bypass in any mode)
+        if (!isOwner) {
+            if (config.botMode === 'private') {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ This command is restricted to bot owner in private mode!'
+                });
+            }
+
+            if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant))) {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ Only admins can use this command!'
+                });
+            }
         }
 
         let targetJid;
@@ -510,7 +587,14 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             targetJid = `${number}@s.whatsapp.net`;
         } else {
             return await sock.sendMessage(msg.key.remoteJid, {
-                text: `❌ Usage: Reply to a message with ${config.prefix}demote or use ${config.prefix}demote <number>`
+                text: `📖 *How to use ${config.prefix}demote*\n\n` +
+                      `*Description:* Demote an admin to member\n\n` +
+                      `*Usage:*\n` +
+                      `• Reply to their message with ${config.prefix}demote\n` +
+                      `• Or use ${config.prefix}demote <number>\n\n` +
+                      `*Examples:*\n` +
+                      `1. Reply to someone's message: ${config.prefix}demote\n` +
+                      `2. ${config.prefix}demote 2349012345678`
             });
         }
 
@@ -612,6 +696,136 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
         } catch (error) {
             await sock.sendMessage(msg.key.remoteJid, {
                 text: `❌ Failed to list members: ${error.message}`
+            });
+        }
+    });
+
+    registerCommand('mute', 'Mute the group', async (sock, msg, args) => {
+        if (!isGroup(msg.key.remoteJid)) {
+            return await sock.sendMessage(msg.key.remoteJid, {
+                text: '❌ This command is only for groups!'
+            });
+        }
+
+        // Get sender number
+        const senderNumber = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+        const isOwner = senderNumber === config.ownerNumber;
+
+        // Check if user is admin (owner can bypass in any mode)
+        if (!isOwner) {
+            if (config.botMode === 'private') {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ This command is restricted to bot owner in private mode!'
+                });
+            }
+
+            if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant))) {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ Only admins can use this command!'
+                });
+            }
+        }
+
+        try {
+            // Parse minutes if provided
+            const minutes = args.length > 0 ? parseInt(args[0]) : 0;
+
+            if (args.length > 0 && (isNaN(minutes) || minutes <= 0)) {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: `📖 *How to use ${config.prefix}mute*\n\n` +
+                          `*Description:* Mute the group\n\n` +
+                          `*Usage:*\n` +
+                          `• ${config.prefix}mute - Mute indefinitely\n` +
+                          `• ${config.prefix}mute <minutes> - Mute for specified time\n\n` +
+                          `*Examples:*\n` +
+                          `1. ${config.prefix}mute\n` +
+                          `2. ${config.prefix}mute 30 (mutes for 30 minutes)`
+                });
+            }
+
+            // Mute the group (only admins can send messages)
+            await sock.groupSettingUpdate(msg.key.remoteJid, 'announcement');
+
+            // Clear any existing timer for this group
+            if (muteTimers.has(msg.key.remoteJid)) {
+                clearTimeout(muteTimers.get(msg.key.remoteJid));
+                muteTimers.delete(msg.key.remoteJid);
+            }
+
+            if (minutes > 0) {
+                await sock.sendMessage(msg.key.remoteJid, {
+                    text: `🔇 *Group Muted*\n\n⏰ Duration: ${minutes} minute${minutes === 1 ? '' : 's'}\n\nOnly admins can send messages.`
+                });
+
+                // Set auto-unmute timer
+                const timer = setTimeout(async () => {
+                    try {
+                        await sock.groupSettingUpdate(msg.key.remoteJid, 'not_announcement');
+                        await sock.sendMessage(msg.key.remoteJid, {
+                            text: `🔊 *Group Auto-Unmuted*\n\nEveryone can send messages again!`
+                        });
+                        muteTimers.delete(msg.key.remoteJid);
+                    } catch (error) {
+                        console.error('Auto-unmute failed:', error);
+                        muteTimers.delete(msg.key.remoteJid);
+                    }
+                }, minutes * 60 * 1000);
+
+                muteTimers.set(msg.key.remoteJid, timer);
+            } else {
+                await sock.sendMessage(msg.key.remoteJid, {
+                    text: `🔇 *Group Muted*\n\nOnly admins can send messages.\nUse ${config.prefix}unmute to unmute.`
+                });
+            }
+        } catch (error) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Failed to mute group: ${error.message}`
+            });
+        }
+    });
+
+    registerCommand('unmute', 'Unmute the group', async (sock, msg) => {
+        if (!isGroup(msg.key.remoteJid)) {
+            return await sock.sendMessage(msg.key.remoteJid, {
+                text: '❌ This command is only for groups!'
+            });
+        }
+
+        // Get sender number
+        const senderNumber = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+        const isOwner = senderNumber === config.ownerNumber;
+
+        // Check if user is admin (owner can bypass in any mode)
+        if (!isOwner) {
+            if (config.botMode === 'private') {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ This command is restricted to bot owner in private mode!'
+                });
+            }
+
+            if (!(await isUserAdmin(sock, msg.key.remoteJid, msg.key.participant))) {
+                return await sock.sendMessage(msg.key.remoteJid, {
+                    text: '❌ Only admins can use this command!'
+                });
+            }
+        }
+
+        try {
+            // Clear any existing auto-unmute timer
+            if (muteTimers.has(msg.key.remoteJid)) {
+                clearTimeout(muteTimers.get(msg.key.remoteJid));
+                muteTimers.delete(msg.key.remoteJid);
+            }
+
+            // Unmute the group
+            await sock.groupSettingUpdate(msg.key.remoteJid, 'not_announcement');
+
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `🔊 *Group Unmuted*\n\nEveryone can send messages again!`
+            });
+        } catch (error) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Failed to unmute group: ${error.message}`
             });
         }
     });
