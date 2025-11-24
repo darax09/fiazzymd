@@ -1,10 +1,11 @@
 require('dotenv').config();
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
+const createPermissions = require('./permissions');
 
 // Bot Configuration from .env
 const config = {
@@ -28,6 +29,8 @@ const commands = new Map();
 
 // Mute timers storage
 const muteTimers = new Map();
+const autoViewOnceChats = new Set();
+const messageStore = new Map();
 
 function registerCommand(name, description, handler) {
     commands.set(name, { description, handler });
@@ -138,7 +141,11 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
         keepAliveIntervalMs: 45000,
         markOnlineOnConnect: false,
         syncFullHistory: false,
-        getMessage: async () => undefined,
+        getMessage: async (key) => {
+            const k = `${key.remoteJid}:${key.id}`;
+            const m = messageStore.get(k);
+            return m || undefined;
+        },
         // Remove printQRInTerminal to avoid deprecation warning
     });
 
@@ -242,52 +249,24 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
     });
 
     sock.ev.on('creds.update', saveCreds);
+    const Permissions = createPermissions(config);
 
     // Helper function to check if chat is a group
-    const isGroup = (jid) => jid.endsWith('@g.us');
+    const isGroup = Permissions.isGroup;
 
     // Helper function to check if user is admin
-    const isUserAdmin = async (sock, groupJid, userJid) => {
-        try {
-            const groupMetadata = await sock.groupMetadata(groupJid);
-            const participant = groupMetadata.participants.find(p => p.id === userJid);
-            return participant?.admin === 'admin' || participant?.admin === 'superadmin';
-        } catch {
-            return false;
-        }
-    };
+    const isUserAdmin = (sock, groupJid, userJid) => Permissions.isUserAdmin(sock, groupJid, userJid);
 
-    const groupAdminCommands = new Set(['add', 'kick', 'promote', 'demote', 'mute', 'unmute', 'tag']);
-    const groupOnlyCommands = new Set(['add', 'kick', 'promote', 'demote', 'mute', 'unmute', 'tag', 'tagall']);
-    const generalCommands = new Set(['menu', 'ping', 'help', 'session', 'tagall']);
+    const groupAdminCommands = Permissions.groupAdminCommands;
+    const groupOnlyCommands = Permissions.groupOnlyCommands;
+    const generalCommands = Permissions.generalCommands;
+    const varCommands = Permissions.varCommands;
 
-    const getSenderNumber = (msg) => {
-        const part = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
-        return part;
-    };
+    const getSenderNumber = (msg) => Permissions.getSenderNumber(msg);
 
-    const canRunCommand = async (sock, msg, cmdName) => {
-        const senderNumber = getSenderNumber(msg);
-        const isOwner = senderNumber === config.ownerNumber;
-        if (isOwner) return { allowed: true };
+    const canRunCommand = (sock, msg, cmdName) => Permissions.canRunCommand(sock, msg, cmdName);
 
-        if (config.botMode === 'private') {
-            return { allowed: false, reason: '❌ This command is restricted to bot owner in private mode!' };
-        }
-
-        const inGroup = isGroup(msg.key.remoteJid);
-        if (groupOnlyCommands.has(cmdName) && !inGroup) {
-            return { allowed: false, reason: '❌ This command is only for groups!' };
-        }
-
-        if (groupAdminCommands.has(cmdName)) {
-            const userJid = msg.key.participant;
-            const isAdmin = await isUserAdmin(sock, msg.key.remoteJid, userJid);
-            if (!isAdmin) return { allowed: false, reason: '❌ Only admins can use this command!' };
-        }
-
-        return { allowed: true };
-    };
+    const PermissionsObj = Permissions;
 
     // Reusable permission checker for admin commands
     const checkAdminPermission = async (sock, msg) => {
@@ -363,6 +342,13 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
 │ ${config.prefix}ping
 │ ${config.prefix}help
 │ ${config.prefix}session
+│ ${config.prefix}vv
+╰──────────────────────╯
+
+╭──────────────────────╮
+│  🧩 *VAR COMMANDS*     │
+╰──────────────────────╯
+│ ${config.prefix}autoviewonce
 ╰──────────────────────╯
 
 💡 Type ${config.prefix}help <command> for details
@@ -732,6 +718,80 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
         }
     });
 
+    const unwrapViewOnce = (m) => {
+        if (!m) return null;
+        let x = m;
+        if (x.ephemeralMessage) x = x.ephemeralMessage.message;
+        if (x.viewOnceMessageV2 && x.viewOnceMessageV2.message) return x.viewOnceMessageV2.message;
+        if (x.viewOnceMessage && x.viewOnceMessage.message) return x.viewOnceMessage.message;
+        if (x.viewOnceMessageV2Extension && x.viewOnceMessageV2Extension.message) return x.viewOnceMessageV2Extension.message;
+        return null;
+    };
+
+    const getQuotedMessage = (msg) => {
+        if (!msg || !msg.message) return null;
+        let m = msg.message;
+        if (m.ephemeralMessage) m = m.ephemeralMessage.message;
+        const candidates = [
+            m.extendedTextMessage,
+            m.imageMessage,
+            m.videoMessage,
+            m.documentMessage,
+            m.audioMessage,
+            m.stickerMessage,
+            m.buttonsResponseMessage,
+            m.templateButtonReplyMessage
+        ];
+        for (const c of candidates) {
+            if (!c || !c.contextInfo) continue;
+            const ctx = c.contextInfo;
+            if (ctx.quotedMessage) return ctx.quotedMessage;
+            const stanzaId = ctx.stanzaId || ctx.stanzaIdV2 || ctx.quotedStanzaID;
+            if (stanzaId) {
+                const loaded = messageStore.get(`${msg.key.remoteJid}:${stanzaId}`);
+                if (loaded) return loaded;
+            }
+        }
+        return null;
+    };
+
+    registerCommand('vv', 'Open and resend a view-once media', async (sock, msg) => {
+        const quotedMsg = getQuotedMessage(msg);
+        const inner = unwrapViewOnce(quotedMsg);
+        if (!inner) {
+            await sock.sendMessage(msg.key.remoteJid, { text: `❌ Reply to a view-once image/video with ${config.prefix}vv` });
+            return;
+        }
+        try {
+            const buffer = await downloadMediaMessage({ message: inner }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+            if (inner.imageMessage) {
+                await sock.sendMessage(msg.key.remoteJid, { image: buffer, caption: 'Opened view-once 👀' });
+            } else if (inner.videoMessage) {
+                await sock.sendMessage(msg.key.remoteJid, { video: buffer, caption: 'Opened view-once 👀' });
+            } else {
+                await sock.sendMessage(msg.key.remoteJid, { text: `❌ Unsupported view-once media type` });
+            }
+        } catch (error) {
+            await sock.sendMessage(msg.key.remoteJid, { text: `❌ Failed to open view-once: ${error.message}` });
+        }
+    });
+
+    registerCommand('autoviewonce', 'Toggle auto-open of view-once media', async (sock, msg, args) => {
+        const arg = (args[0] || '').toLowerCase();
+        if (arg === 'on') {
+            autoViewOnceChats.add(msg.key.remoteJid);
+            await sock.sendMessage(msg.key.remoteJid, { text: '✅ Auto view-once enabled for this chat' });
+        } else if (arg === 'off') {
+            autoViewOnceChats.delete(msg.key.remoteJid);
+            await sock.sendMessage(msg.key.remoteJid, { text: '✅ Auto view-once disabled for this chat' });
+        } else {
+            const enabled = autoViewOnceChats.has(msg.key.remoteJid);
+            await sock.sendMessage(msg.key.remoteJid, { text: `📊 Auto view-once is ${enabled ? 'ON' : 'OFF'}
+
+Use ${config.prefix}autoviewonce on/off` });
+        }
+    });
+
     registerCommand('mute', 'Mute the group', async (sock, msg, args) => {
         if (!isGroup(msg.key.remoteJid)) {
             return await sock.sendMessage(msg.key.remoteJid, {
@@ -965,10 +1025,30 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             const msg = m.messages[0];
             if (!msg.message) return;
 
+            const preText = extractMessageText(msg.message).trim();
+            if (msg.key.fromMe && !preText.startsWith(config.prefix)) return;
+
             console.log('📩 New message from:', msg.key.remoteJid);
 
-            // Extract message text using universal extractor
-            const messageText = extractMessageText(msg.message).trim();
+            try {
+                const id = msg.key.id || '';
+                const k = `${msg.key.remoteJid}:${id}`;
+                if (!messageStore.has(k)) messageStore.set(k, msg.message);
+            } catch {}
+
+            const incomingVOMsg = unwrapViewOnce(msg.message);
+            if (!msg.key.fromMe && autoViewOnceChats.has(msg.key.remoteJid) && incomingVOMsg) {
+                try {
+                    const buffer = await downloadMediaMessage({ message: incomingVOMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                    if (incomingVOMsg.imageMessage) {
+                        await sock.sendMessage(msg.key.remoteJid, { image: buffer, caption: 'Opened view-once 👀' });
+                    } else if (incomingVOMsg.videoMessage) {
+                        await sock.sendMessage(msg.key.remoteJid, { video: buffer, caption: 'Opened view-once 👀' });
+                    }
+                } catch {}
+            }
+
+            const messageText = preText;
 
             // Return if no message text
             if (!messageText || messageText.length === 0) return;
@@ -993,7 +1073,7 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             const senderNumber = msg.key.remoteJid.split('@')[0];
 
             // Check bot mode and permissions
-            const permission = await canRunCommand(sock, msg, commandName);
+            const permission = await PermissionsObj.canRunCommand(sock, msg, commandName);
             if (!permission.allowed) {
                 await sock.sendMessage(msg.key.remoteJid, { text: permission.reason });
                 return;
