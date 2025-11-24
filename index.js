@@ -257,6 +257,38 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
         }
     };
 
+    const groupAdminCommands = new Set(['add', 'kick', 'promote', 'demote', 'mute', 'unmute', 'tag']);
+    const groupOnlyCommands = new Set(['add', 'kick', 'promote', 'demote', 'mute', 'unmute', 'tag', 'tagall']);
+    const generalCommands = new Set(['menu', 'ping', 'help', 'session', 'tagall']);
+
+    const getSenderNumber = (msg) => {
+        const part = msg.key.participant ? msg.key.participant.split('@')[0] : msg.key.remoteJid.split('@')[0];
+        return part;
+    };
+
+    const canRunCommand = async (sock, msg, cmdName) => {
+        const senderNumber = getSenderNumber(msg);
+        const isOwner = senderNumber === config.ownerNumber;
+        if (isOwner) return { allowed: true };
+
+        if (config.botMode === 'private') {
+            return { allowed: false, reason: '❌ This command is restricted to bot owner in private mode!' };
+        }
+
+        const inGroup = isGroup(msg.key.remoteJid);
+        if (groupOnlyCommands.has(cmdName) && !inGroup) {
+            return { allowed: false, reason: '❌ This command is only for groups!' };
+        }
+
+        if (groupAdminCommands.has(cmdName)) {
+            const userJid = msg.key.participant;
+            const isAdmin = await isUserAdmin(sock, msg.key.remoteJid, userJid);
+            if (!isAdmin) return { allowed: false, reason: '❌ Only admins can use this command!' };
+        }
+
+        return { allowed: true };
+    };
+
     // Reusable permission checker for admin commands
     const checkAdminPermission = async (sock, msg) => {
         // Check if it's a group
@@ -961,11 +993,10 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             const senderNumber = msg.key.remoteJid.split('@')[0];
 
             // Check bot mode and permissions
-            if (config.botMode === 'private') {
-                if (senderNumber !== config.ownerNumber) {
-                    console.log(`❌ Unauthorized access attempt from: ${senderNumber}`);
-                    return;
-                }
+            const permission = await canRunCommand(sock, msg, commandName);
+            if (!permission.allowed) {
+                await sock.sendMessage(msg.key.remoteJid, { text: permission.reason });
+                return;
             }
 
             // Execute command
