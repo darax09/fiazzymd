@@ -1,9 +1,19 @@
+require('dotenv').config();
 const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
+
+// Bot Configuration from .env
+const config = {
+    botMode: process.env.BOT_MODE || 'public',
+    prefix: process.env.PREFIX || '.',
+    ownerNumber: process.env.OWNER_NUMBER || '',
+    botName: process.env.BOT_NAME || 'FiazzyMD',
+    botVersion: process.env.BOT_VERSION || '1.0.0',
+};
 
 // Create readline interface
 const rl = readline.createInterface({
@@ -12,6 +22,13 @@ const rl = readline.createInterface({
 });
 
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
+
+// Command Registry
+const commands = new Map();
+
+function registerCommand(name, description, handler) {
+    commands.set(name, { description, handler });
+}
 
 // Session Manager
 class SessionManager {
@@ -223,57 +240,214 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // Register Commands
+    registerCommand('menu', 'Display bot menu with all commands', async (sock, msg) => {
+        const commandList = Array.from(commands.entries())
+            .map(([name]) => `${config.prefix}${name}`)
+            .join('\n');
+
+        const menuText = `╭─────────────────╮
+│ *${config.botName}*
+╰─────────────────╯
+
+📌 *Bot Information*
+• Prefix: ${config.prefix}
+• Mode: ${config.botMode.toUpperCase()}
+• Commands: ${commands.size}
+• Version: ${config.botVersion}
+
+📋 *Available Commands*
+${commandList}
+
+💡 Type ${config.prefix}help <command> for details
+
+${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public Mode - Everyone'}`;
+
+        // Check if menu image exists (supports multiple formats)
+        const imageFormats = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
+        let menuImagePath = null;
+
+        for (const format of imageFormats) {
+            const imagePath = path.join(__dirname, `menu_img.${format}`);
+            if (fs.existsSync(imagePath)) {
+                menuImagePath = imagePath;
+                console.log(`✅ Found menu image: menu_img.${format}`);
+                break;
+            }
+        }
+
+        try {
+            if (menuImagePath) {
+                // Send with image
+                console.log('📤 Sending menu with image...');
+                await sock.sendMessage(msg.key.remoteJid, {
+                    image: fs.readFileSync(menuImagePath),
+                    caption: menuText
+                });
+                console.log('✅ Menu sent successfully with image');
+            } else {
+                // Send text only if image doesn't exist
+                console.log('📤 Sending menu as text (no image found)...');
+                await sock.sendMessage(msg.key.remoteJid, { text: menuText });
+                console.log('✅ Menu sent successfully as text');
+            }
+        } catch (error) {
+            // Fallback to text if image fails
+            console.error('⚠️  Failed to send menu with image:', error.message);
+            console.log('📤 Fallback: Sending menu as text...');
+            await sock.sendMessage(msg.key.remoteJid, { text: menuText });
+            console.log('✅ Menu sent successfully as text (fallback)');
+        }
+    });
+
+    registerCommand('ping', 'Check bot response time', async (sock, msg) => {
+        const start = Date.now();
+        const sentMsg = await sock.sendMessage(msg.key.remoteJid, {
+            text: '🏓 Pinging...'
+        });
+        const end = Date.now();
+        const ping = end - start;
+
+        await sock.sendMessage(msg.key.remoteJid, {
+            text: `🏓 *Pong!*\n\n⚡ Response Time: ${ping}ms\n📊 Speed: ${ping < 100 ? 'Excellent' : ping < 300 ? 'Good' : 'Fair'}`
+        }, { quoted: sentMsg });
+    });
+
+    registerCommand('help', 'Show command details', async (sock, msg, args) => {
+        if (args.length === 0) {
+            const commandList = Array.from(commands.entries())
+                .map(([name, { description }]) => `• *${config.prefix}${name}* - ${description}`)
+                .join('\n');
+
+            const helpText = `🤖 *${config.botName} Help*\n\n${commandList}\n\n💡 Use ${config.prefix}help <command> for specific command info`;
+            await sock.sendMessage(msg.key.remoteJid, { text: helpText });
+        } else {
+            const cmdName = args[0].toLowerCase();
+            const cmd = commands.get(cmdName);
+
+            if (cmd) {
+                await sock.sendMessage(msg.key.remoteJid, {
+                    text: `📖 *Command: ${config.prefix}${cmdName}*\n\n${cmd.description}`
+                });
+            } else {
+                await sock.sendMessage(msg.key.remoteJid, {
+                    text: `❌ Command "${cmdName}" not found.\n\nUse ${config.prefix}menu to see all commands.`
+                });
+            }
+        }
+    });
+
+    registerCommand('session', 'View current session info', async (sock, msg) => {
+        await sock.sendMessage(msg.key.remoteJid, {
+            text: `📊 *Session Information*\n\n` +
+                  `• Session: ${sessionManager.currentSession}\n` +
+                  `• Device: ${sock.user.name || config.botName}\n` +
+                  `• Number: ${sock.user.id.split(':')[0]}\n` +
+                  `• Mode: ${config.botMode.toUpperCase()}\n` +
+                  `• Status: Active ✅`
+        });
+    });
+
+    // Universal message text extractor (handles all WhatsApp message types)
+    function extractMessageText(message) {
+        try {
+            if (!message) return '';
+
+            // Direct conversation
+            if (message.conversation) return message.conversation;
+
+            // Extended text message
+            if (message.extendedTextMessage?.text)
+                return message.extendedTextMessage.text;
+
+            // Ephemeral (disappearing) messages
+            if (message.ephemeralMessage)
+                return extractMessageText(message.ephemeralMessage.message);
+
+            // View once messages
+            if (message.viewOnceMessage || message.viewOnceMessageV2 || message.viewOnceMessageV2Extension)
+                return extractMessageText(message.viewOnceMessage?.message || message.viewOnceMessageV2?.message);
+
+            // Image/Video captions
+            if (message.imageMessage?.caption)
+                return message.imageMessage.caption;
+
+            if (message.videoMessage?.caption)
+                return message.videoMessage.caption;
+
+            // Document caption
+            if (message.documentMessage?.caption)
+                return message.documentMessage.caption;
+
+            // Button responses
+            if (message.buttonsResponseMessage?.selectedButtonId)
+                return message.buttonsResponseMessage.selectedButtonId;
+
+            // List responses
+            if (message.listResponseMessage?.singleSelectReply?.selectedRowId)
+                return message.listResponseMessage.singleSelectReply.selectedRowId;
+
+            // Template button response
+            if (message.templateButtonReplyMessage?.selectedId)
+                return message.templateButtonReplyMessage.selectedId;
+
+            return '';
+        } catch {
+            return '';
+        }
+    }
+
     // Handle incoming messages
     sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
+        try {
+            const msg = m.messages[0];
+            if (!msg.message) return;
 
-        if (!msg.key.fromMe && m.type === 'notify') {
             console.log('📩 New message from:', msg.key.remoteJid);
 
-            // Extract message text
-            const messageText = msg.message?.conversation ||
-                              msg.message?.extendedTextMessage?.text ||
-                              '';
+            // Extract message text using universal extractor
+            const messageText = extractMessageText(msg.message).trim();
 
-            if (messageText) {
-                console.log('💬 Message:', messageText);
+            // Return if no message text
+            if (!messageText || messageText.length === 0) return;
 
-                // Command handler
-                const command = messageText.toLowerCase().trim();
+            console.log('💬 Message:', messageText);
+            console.log('🔍 Prefix:', config.prefix);
+            console.log('🔍 Starts with prefix?', messageText.startsWith(config.prefix));
 
-                if (command === 'ping') {
-                    await sock.sendMessage(msg.key.remoteJid, {
-                        text: '🏓 Pong! Bot is active and running.\n\n⏰ Response time: ' + new Date().toLocaleTimeString()
-                    });
-                } else if (command === 'hi' || command === 'hello') {
-                    await sock.sendMessage(msg.key.remoteJid, {
-                        text: '👋 Hello! I am FiazzyMD WhatsApp Bot.\n\n' +
-                              '🤖 Available commands:\n' +
-                              '• ping - Check bot status\n' +
-                              '• hi/hello - Get greeting\n' +
-                              '• help - Show help menu\n' +
-                              '• session - View session info'
-                    });
-                } else if (command === 'help') {
-                    await sock.sendMessage(msg.key.remoteJid, {
-                        text: '🤖 *FiazzyMD Bot Help*\n\n' +
-                              '📌 Available Commands:\n\n' +
-                              '• *ping* - Check if bot is active\n' +
-                              '• *hi/hello* - Get a greeting\n' +
-                              '• *help* - Show this help message\n' +
-                              '• *session* - View current session info\n\n' +
-                              '✨ More features coming soon!'
-                    });
-                } else if (command === 'session') {
-                    await sock.sendMessage(msg.key.remoteJid, {
-                        text: '📊 *Session Information*\n\n' +
-                              `• Session Name: ${sessionManager.currentSession}\n` +
-                              `• Device: ${sock.user.name || 'FiazzyMD'}\n` +
-                              `• Number: ${sock.user.id.split(':')[0]}\n` +
-                              `• Status: Active ✅`
-                    });
+            // Check if message starts with prefix
+            if (!messageText.startsWith(config.prefix)) {
+                console.log('❌ Message does not start with prefix, ignoring');
+                return;
+            }
+
+            // Parse command
+            const args = messageText.slice(config.prefix.length).trim().split(/\s+/);
+            const commandName = args.shift().toLowerCase();
+            console.log('🔍 Command name:', commandName);
+            console.log('🔍 Command exists?', commands.has(commandName));
+
+            // Get sender number
+            const senderNumber = msg.key.remoteJid.split('@')[0];
+
+            // Check bot mode and permissions
+            if (config.botMode === 'private') {
+                if (senderNumber !== config.ownerNumber) {
+                    console.log(`❌ Unauthorized access attempt from: ${senderNumber}`);
+                    return;
                 }
             }
+
+            // Execute command
+            const command = commands.get(commandName);
+            if (command) {
+                console.log(`⚡ Executing command: ${config.prefix}${commandName}`);
+                await command.handler(sock, msg, args);
+            } else {
+                console.log(`❓ Unknown command: ${commandName}`);
+            }
+        } catch (error) {
+            console.error('❌ Error handling message:', error.message);
         }
     });
 

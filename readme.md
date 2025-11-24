@@ -7,8 +7,11 @@ A WhatsApp bot built with Baileys that supports both QR code and pairing code au
 - Connect via QR Code or Pairing Code
 - Multi-session management (run multiple WhatsApp accounts)
 - Auto-connect to single session (no prompts!)
-- Auto-reply to messages
-- Built-in commands (ping, hi, help, session)
+- Environment-based configuration (.env file)
+- Public/Private mode (control who can use commands)
+- Customizable command prefix
+- Built-in commands (.menu, .ping, .help, .session)
+- Response time tracking (ping in milliseconds)
 - Persistent authentication sessions
 - Automatic reconnection with exponential backoff
 - Message logging
@@ -20,6 +23,42 @@ A WhatsApp bot built with Baileys that supports both QR code and pairing code au
 ```bash
 pnpm install
 ```
+
+## Configuration
+
+Create a `.env` file in the root directory (or copy from `.env.example`):
+
+```bash
+# Copy example env file
+copy .env.example .env
+```
+
+Edit `.env` with your settings:
+
+```env
+# Bot Mode: 'public' or 'private'
+BOT_MODE=public
+
+# Bot Prefix (default is ".")
+PREFIX=.
+
+# Owner Phone Number (required for private mode)
+OWNER_NUMBER=1234567890
+
+# Bot Information
+BOT_NAME=FiazzyMD
+BOT_VERSION=1.0.0
+```
+
+### Configuration Options:
+
+- **BOT_MODE**:
+  - `public` - Anyone can use bot commands
+  - `private` - Only the owner can use bot commands
+- **PREFIX**: The prefix for commands (default: `.`)
+- **OWNER_NUMBER**: Your phone number (country code without +)
+- **BOT_NAME**: Name of your bot
+- **BOT_VERSION**: Version number
 
 ## Usage
 
@@ -102,20 +141,62 @@ Simply select which session to use, and it will automatically reconnect!
 
 ## Available Commands
 
-When someone sends a message to your bot:
+All commands use the prefix set in your `.env` file (default is `.`):
 
-- `ping` - Bot replies with "Pong! Bot is active." (includes response time)
-- `hi` or `hello` - Bot sends a greeting with command list
-- `help` - Shows detailed help menu with all commands
-- `session` - View current session information and status
+### Main Commands:
+
+- **`.menu`** - Display bot menu with all available commands
+  - Shows bot name, version, mode, prefix
+  - Lists total number of commands
+  - Shows all available commands
+
+- **`.ping`** - Check bot response time
+  - Measures ping in milliseconds
+  - Shows speed rating (Excellent/Good/Fair)
+  - Example output: `Response Time: 145ms`
+
+- **`.help [command]`** - Get help information
+  - Without arguments: Shows all commands with descriptions
+  - With command name: Shows specific command details
+  - Example: `.help ping` shows ping command info
+
+- **`.session`** - View current session information
+  - Shows session name
+  - Device info
+  - Phone number
+  - Bot mode (Public/Private)
+  - Connection status
+
+### Command Examples:
+
+```
+.menu
+.ping
+.help
+.help menu
+.session
+```
+
+### Private Mode:
+
+When `BOT_MODE=private` in `.env`:
+- Only the owner (OWNER_NUMBER) can use commands
+- Other users' commands are silently ignored
+- Console shows unauthorized access attempts
 
 ## Project Structure
 
-- `index.js` - Main bot file with session manager
-- `sessions/` - Folder containing all session data (created automatically)
-  - `session1/` - Example session folder
-  - `business/` - Example session folder
-- `package.json` - Project dependencies
+```
+fiazzymd/
+├── index.js              # Main bot file with command system
+├── .env                  # Your configuration (create from .env.example)
+├── .env.example          # Example configuration file
+├── package.json          # Project dependencies
+├── sessions/             # Session data (auto-created)
+│   ├── session1/         # Example session
+│   └── business/         # Example session
+└── readme.md             # This file
+```
 
 ## Managing Sessions
 
@@ -145,28 +226,39 @@ pnpm clean
 
 Note: This will delete the old `auth_info_baileys` folder if it exists (from older versions).
 
-## Customization
+## Adding Custom Commands
 
-Edit [index.js](index.js) to add your own commands and features. Find the command handler section (around line 207):
+You can easily add your own commands! Edit [index.js](index.js) and add new commands after line 243:
 
 ```javascript
-// Add your custom commands in the messages.upsert event handler
-const command = messageText.toLowerCase().trim();
-
-if (command === 'mycommand') {
+// Add your custom command
+registerCommand('mycommand', 'Description of my command', async (sock, msg, args) => {
     await sock.sendMessage(msg.key.remoteJid, {
         text: '🎉 My custom response!'
     });
-}
+});
+
+// Command with arguments
+registerCommand('echo', 'Echo back your message', async (sock, msg, args) => {
+    const text = args.join(' ') || 'No message provided';
+    await sock.sendMessage(msg.key.remoteJid, {
+        text: `📢 You said: ${text}`
+    });
+});
 ```
 
-You can add as many custom commands as you want!
+Your commands will automatically:
+- Appear in `.menu`
+- Work with `.help`
+- Respect public/private mode
+- Use your configured prefix
 
 ## Dependencies
 
 - `@whiskeysockets/baileys` - WhatsApp Web API
 - `qrcode-terminal` - QR code generation for terminal
 - `pino` - Logger
+- `dotenv` - Environment variable management
 
 ## Troubleshooting
 
@@ -210,10 +302,13 @@ You can add as many custom commands as you want!
 - Example: For +1 234-567-8900, enter: `12345678900`
 - Make sure you're entering the code in WhatsApp within the time limit (usually 1-2 minutes)
 
-**Bot not responding:**
-- Check console logs for errors
-- Ensure the bot is connected (you'll see "✅ Connected Successfully!" message)
-- Verify you received the welcome DM in WhatsApp
+**Bot not responding to commands:**
+- ✅ Fixed! The bot now uses a universal message extractor
+- Handles all WhatsApp message types (conversation, extended, ephemeral, captions, etc.)
+- Make sure you're using the correct prefix (default is `.`)
+- Commands must start with prefix: `.menu` not just `menu`
+- Check console logs - you should see: `⚡ Executing command: .menu`
+- If in private mode, ensure your number matches OWNER_NUMBER in .env
 
 **Multiple sessions not working:**
 - Make sure each session has a unique name
