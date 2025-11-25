@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState, downloadMediaMessage, Browsers, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
 const readline = require('readline');
@@ -67,6 +67,7 @@ const messageStore = new Map();
 const antiLinkSettings = new Map();
 const warnLimits = new Map();
 const warnCounts = new Map();
+let pairingRequested = false;
 
 // Initialize auto view-once from .env
 if (process.env.AUTO_VIEW_ONCE === 'true') {
@@ -173,11 +174,16 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 
 async function connectToWhatsApp(usePairingCode, sessionPath) {
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    const { version } = await fetchLatestBaileysVersion();
+
+    pairingRequested = false;
 
     const sock = makeWASocket({
         logger: pino({ level: 'silent' }),
         auth: state,
-        browser: ['Chrome (Linux)', 'Chrome', '121.0.0'],
+        browser: Browsers.appropriate('Chrome'),
+        version,
+        printQRInTerminal: false,
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 45000,
         markOnlineOnConnect: false,
@@ -187,31 +193,7 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
             const m = messageStore.get(k);
             return m || undefined;
         },
-        // Remove printQRInTerminal to avoid deprecation warning
     });
-
-    // Handle pairing code
-    if (usePairingCode && !sock.authState.creds.registered) {
-        // Wait for socket to be ready before requesting pairing code
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
-        try {
-            const phoneNumber = await question('\nPlease enter your WhatsApp phone number (with country code, no + or spaces): ');
-            const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-
-            console.log('\n🔄 Requesting pairing code for:', cleanNumber);
-
-            const code = await sock.requestPairingCode(cleanNumber);
-            console.log('\n╔══════════════════════════╗');
-            console.log(`║  📱 Pairing Code: ${code}  ║`);
-            console.log('╚══════════════════════════╝\n');
-            console.log('Enter this code in WhatsApp:');
-            console.log('Settings > Linked Devices > Link a Device > Link with phone number instead\n');
-        } catch (error) {
-            console.error('❌ Error requesting pairing code:', error.message);
-            console.log('💡 Make sure you entered a valid phone number with country code\n');
-        }
-    }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -224,7 +206,44 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
             console.log('\n'); // Add spacing after QR
         }
 
-        if (connection === 'close') {
+        if (usePairingCode && !sock.authState.creds.registered && (connection === 'connecting' || !!qr) && !pairingRequested) {
+            pairingRequested = true;
+            const phoneNumber = await question('\n📱 Enter your WhatsApp phone number:\n   (with country code, no + or spaces)\n   Example: 2349012345678\n\n   Number: ');
+            const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+
+            if (!cleanNumber || cleanNumber.length < 10) {
+                console.error('\n❌ Invalid phone number format');
+                console.log('💡 Number must be in E.164 format without +');
+                console.log('   Example: 2349012345678 (not +234 901 234 5678)\n');
+                rl.close();
+                process.exit(1);
+            }
+
+            console.log('\n🔄 Requesting pairing code for:', cleanNumber);
+            try {
+                const code = await sock.requestPairingCode(cleanNumber);
+                console.log('\n╔════════════════════════════════╗');
+                console.log('║                                ║');
+                console.log(`║    📟 PAIRING CODE: ${code}     ║`);
+                console.log('║                                ║');
+                console.log('╚════════════════════════════════╝\n');
+                console.log('📌 Steps to link your device:\n');
+                console.log('   1. Open WhatsApp on your phone');
+                console.log('   2. Tap Settings → Linked Devices');
+                console.log('   3. Tap "Link a Device"');
+                console.log('   4. Tap "Link with phone number instead"');
+                console.log('   5. Enter the code above: ' + code + '\n');
+                console.log('⏳ Waiting for connection... (Bot will auto-connect)\n');
+            } catch (error) {
+                console.error('\n❌ Failed to request pairing code:', error.message);
+                console.log('\n💡 Troubleshooting:');
+                console.log('   • Verify phone number format (must include country code)');
+                console.log('   • Delete session folder if code doesn\'t match number');
+                console.log('   • Wait 10 minutes if too many attempts\n');
+                rl.close();
+                process.exit(1);
+            }
+        } else if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
 
             console.log('❌ Connection closed.');
@@ -732,12 +751,39 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
     });
 
     const unwrapViewOnce = (m) => {
-        if (!m) return null;
+        if (!m) {
+            console.log('🔍 unwrapViewOnce: No message provided');
+            return null;
+        }
+
+        console.log('🔍 unwrapViewOnce: Message keys:', Object.keys(m));
+
         let x = m;
-        if (x.ephemeralMessage) x = x.ephemeralMessage.message;
-        if (x.viewOnceMessageV2 && x.viewOnceMessageV2.message) return x.viewOnceMessageV2.message;
-        if (x.viewOnceMessage && x.viewOnceMessage.message) return x.viewOnceMessage.message;
-        if (x.viewOnceMessageV2Extension && x.viewOnceMessageV2Extension.message) return x.viewOnceMessageV2Extension.message;
+
+        // Unwrap ephemeral first
+        if (x.ephemeralMessage) {
+            console.log('🔍 unwrapViewOnce: Unwrapping ephemeralMessage');
+            x = x.ephemeralMessage.message;
+        }
+
+        // Check all view-once variants
+        if (x.viewOnceMessageV2 && x.viewOnceMessageV2.message) {
+            console.log('✅ unwrapViewOnce: Found viewOnceMessageV2');
+            return x.viewOnceMessageV2.message;
+        }
+
+        if (x.viewOnceMessage && x.viewOnceMessage.message) {
+            console.log('✅ unwrapViewOnce: Found viewOnceMessage');
+            return x.viewOnceMessage.message;
+        }
+
+        if (x.viewOnceMessageV2Extension && x.viewOnceMessageV2Extension.message) {
+            console.log('✅ unwrapViewOnce: Found viewOnceMessageV2Extension');
+            return x.viewOnceMessageV2Extension.message;
+        }
+
+        console.log('❌ unwrapViewOnce: No view-once message found');
+        console.log('Available keys:', Object.keys(x));
         return null;
     };
 
@@ -745,6 +791,8 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
         if (!msg || !msg.message) return null;
         let m = msg.message;
         if (m.ephemeralMessage) m = m.ephemeralMessage.message;
+
+        // Check all possible message types for contextInfo
         const candidates = [
             m.extendedTextMessage,
             m.imageMessage,
@@ -753,38 +801,85 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             m.audioMessage,
             m.stickerMessage,
             m.buttonsResponseMessage,
-            m.templateButtonReplyMessage
+            m.templateButtonReplyMessage,
+            m.conversation ? { contextInfo: m.contextInfo } : null
         ];
+
         for (const c of candidates) {
             if (!c || !c.contextInfo) continue;
             const ctx = c.contextInfo;
-            if (ctx.quotedMessage) return ctx.quotedMessage;
+
+            // First try: direct quotedMessage
+            if (ctx.quotedMessage) {
+                console.log('✅ Found quoted message via contextInfo.quotedMessage');
+                return ctx.quotedMessage;
+            }
+
+            // Second try: stanzaId lookup in messageStore
             const stanzaId = ctx.stanzaId || ctx.stanzaIdV2 || ctx.quotedStanzaID;
             if (stanzaId) {
                 const loaded = messageStore.get(`${msg.key.remoteJid}:${stanzaId}`);
-                if (loaded) return loaded;
+                if (loaded) {
+                    console.log('✅ Found quoted message via stanzaId:', stanzaId);
+                    return loaded;
+                }
             }
         }
+
+        console.log('❌ No quoted message found');
         return null;
     };
 
     registerCommand('vv', 'Open and resend a view-once media', async (sock, msg) => {
+        console.log('🔍 VV Command Debug:');
+        console.log('Message keys:', Object.keys(msg));
+        console.log('Message.message keys:', msg.message ? Object.keys(msg.message) : 'none');
+
         const quotedMsg = getQuotedMessage(msg);
-        const inner = unwrapViewOnce(quotedMsg);
-        if (!inner) {
-            await sock.sendMessage(msg.key.remoteJid, { text: `❌ Reply to a view-once image/video with ${config.prefix}vv` });
+        console.log('Quoted message:', quotedMsg ? 'Found' : 'Not found');
+
+        if (!quotedMsg) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Please reply to a view-once message with ${config.prefix}vv`
+            });
             return;
         }
+
+        // Check if it's actually a view-once message
+        const hasViewOnce = quotedMsg.viewOnceMessage || quotedMsg.viewOnceMessageV2 || quotedMsg.viewOnceMessageV2Extension;
+        if (!hasViewOnce) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ That's not a view-once message!\n\n💡 The message you replied to is a regular ${Object.keys(quotedMsg)[0] || 'message'}`
+            });
+            return;
+        }
+
+        const inner = unwrapViewOnce(quotedMsg);
+        console.log('View-once unwrapped:', inner ? 'Yes' : 'No');
+
+        if (!inner) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Failed to unwrap view-once message`
+            });
+            return;
+        }
+
         try {
+            console.log('📥 Downloading view-once media...');
             const buffer = await downloadMediaMessage({ message: inner }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+
             if (inner.imageMessage) {
+                console.log('📤 Sending image...');
                 await sock.sendMessage(msg.key.remoteJid, { image: buffer, caption: 'Opened view-once 👀' });
             } else if (inner.videoMessage) {
+                console.log('📤 Sending video...');
                 await sock.sendMessage(msg.key.remoteJid, { video: buffer, caption: 'Opened view-once 👀' });
             } else {
+                console.log('❌ Unsupported media type');
                 await sock.sendMessage(msg.key.remoteJid, { text: `❌ Unsupported view-once media type` });
             }
         } catch (error) {
+            console.error('❌ VV Error:', error);
             await sock.sendMessage(msg.key.remoteJid, { text: `❌ Failed to open view-once: ${error.message}` });
         }
     });
