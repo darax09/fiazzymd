@@ -1,8 +1,8 @@
 module.exports = (config) => {
   const groupAdminCommands = new Set(['add', 'kick', 'promote', 'demote', 'mute', 'unmute', 'warn', 'antilink', 'warnlimit', 'tag', 'tagall', 'resetwarn']);
   const groupOnlyCommands = new Set(['add', 'kick', 'promote', 'demote', 'mute', 'unmute', 'tag', 'tagall', 'warn', 'antilink', 'warnlimit', 'resetwarn']);
-  const generalCommands = new Set(['menu', 'ping', 'help', 'session', 'vv']);
-  const varCommands = new Set(['autoviewonce', 'setvar']); // Commands that modify global .env settings
+  const generalCommands = new Set(['menu', 'ping', 'help', 'session', 'vv', 'del', 'sticker']);
+  const varCommands = new Set(['autoviewonce', 'setvar', 'mode', 'prefix', 'ownernumber', 'seevar', 'antidelete']); // Commands that modify global .env settings
 
   const isGroup = (jid) => jid.endsWith('@g.us');
 

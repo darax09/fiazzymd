@@ -5,7 +5,9 @@ const pino = require('pino');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
+const { createStickerBuffer } = require('./features/sticker');
 const createPermissions = require('./permissions');
+const { searchSongs, downloadSong, formatSearchResults } = require('./features/songs');
 
 // Bot Configuration from .env
 const config = {
@@ -67,10 +69,17 @@ const messageStore = new Map();
 const antiLinkSettings = new Map();
 const warnLimits = new Map();
 const warnCounts = new Map();
+const songSearchResults = new Map(); // Store search results for each user
+const antiDeleteChats = new Map();
 
 // Initialize auto view-once from .env
 if (process.env.AUTO_VIEW_ONCE === 'true') {
     autoViewOnceChats.add('global');
+}
+
+// Initialize anti-delete from .env (global)
+if (process.env.AUTO_ANTI_DELETE === 'true') {
+    antiDeleteChats.set('global', true);
 }
 
 function registerCommand(name, description, handler) {
@@ -420,15 +429,29 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
 │ ${config.prefix}help
 │ ${config.prefix}session
 │ ${config.prefix}vv
+│ ${config.prefix}block
+│ ${config.prefix}del
+│ ${config.prefix}sticker
+╰──────────────────────╯
+
+╭──────────────────────╮
+│  📥 *DOWNLOADS*        │
+╰──────────────────────╯
+│ ${config.prefix}songs - Download songs
 ╰──────────────────────╯
 
 ╭──────────────────────╮
 │  🧩 *VAR COMMANDS*     │
 ╰──────────────────────╯
-│ ${config.prefix}setvar
-│ ${config.prefix}autoviewonce
-│ ${config.prefix}warnlimit
-│ ${config.prefix}antilink
+│ ${config.prefix}seevar - View all vars
+│ ${config.prefix}mode - Change bot mode
+│ ${config.prefix}prefix - Change prefix
+│ ${config.prefix}ownernumber - Set owner
+│ ${config.prefix}setvar - Set any var
+│ ${config.prefix}autoviewonce - Auto view-once
+│ ${config.prefix}antidelete - Anti-delete (owner only)
+│ ${config.prefix}warnlimit - Warn limit
+│ ${config.prefix}antilink - Anti-link
 ╰──────────────────────╯
 
 💡 Type ${config.prefix}help <command> for details
@@ -951,6 +974,92 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
         }
     });
 
+    registerCommand('del', 'Delete the replied message', async (sock, msg) => {
+        const chatId = msg.key.remoteJid;
+        const m = msg.message || {};
+        const ctx = m.extendedTextMessage?.contextInfo || m.imageMessage?.contextInfo || m.videoMessage?.contextInfo || m.documentMessage?.contextInfo || m.audioMessage?.contextInfo || m.stickerMessage?.contextInfo || null;
+        const stanzaId = ctx?.stanzaId;
+        const participant = ctx?.participant;
+        if (!stanzaId) {
+            await sock.sendMessage(chatId, { text: `❌ Reply to a message with ${config.prefix}del` });
+            return;
+        }
+        const delKey = { remoteJid: chatId, id: stanzaId };
+        if (participant) delKey.participant = participant;
+        try {
+            await sock.sendMessage(chatId, { delete: delKey });
+        } catch (error) {
+            await sock.sendMessage(chatId, { text: `❌ Failed to delete: ${error.message}` });
+        }
+    });
+
+    registerCommand('sticker', 'Convert replied image to sticker', async (sock, msg) => {
+        const chatId = msg.key.remoteJid;
+        const m = msg.message || {};
+        const quotedMsg = getQuotedMessage(msg);
+        if (!quotedMsg) {
+            await sock.sendMessage(chatId, { text: `❌ Reply to an image with ${config.prefix}sticker` });
+            return;
+        }
+        let q = quotedMsg;
+        if (q.ephemeralMessage) q = q.ephemeralMessage.message;
+        if (!q.imageMessage) {
+            await sock.sendMessage(chatId, { text: `❌ Reply to an image to convert into sticker` });
+            return;
+        }
+        try {
+            const buffer = await downloadMediaMessage({ message: quotedMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+            const stickerBuffer = await createStickerBuffer(buffer, 'Fiazzy-Md', 'fiazzy');
+            await sock.sendMessage(chatId, { sticker: stickerBuffer });
+        } catch (error) {
+            await sock.sendMessage(chatId, { text: `❌ Failed to create sticker: ${error.message}` });
+        }
+    });
+
+    registerCommand('s', 'Alias for sticker', async (sock, msg, args) => {
+        const handler = commands.get('sticker');
+        if (handler) return handler(sock, msg, args);
+    });
+
+    registerCommand('antidelete', 'Toggle anti-delete globally (saved in .env)', async (sock, msg, args) => {
+        const arg = (args[0] || '').toLowerCase();
+        if (arg === 'on') {
+            const success = updateEnvFile('AUTO_ANTI_DELETE', 'true');
+            if (success) {
+                process.env.AUTO_ANTI_DELETE = 'true';
+                antiDeleteChats.set('global', true);
+                await sock.sendMessage(msg.key.remoteJid, { text: '✅ Anti-delete enabled globally\n\n💡 This setting is saved to .env and will persist after restart' });
+            } else {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Failed to update .env file' });
+            }
+        } else if (arg === 'off') {
+            const success = updateEnvFile('AUTO_ANTI_DELETE', 'false');
+            if (success) {
+                process.env.AUTO_ANTI_DELETE = 'false';
+                antiDeleteChats.clear();
+                await sock.sendMessage(msg.key.remoteJid, { text: '✅ Anti-delete disabled globally\n\n💡 This setting is saved to .env' });
+            } else {
+                await sock.sendMessage(msg.key.remoteJid, { text: '❌ Failed to update .env file' });
+            }
+        } else {
+            const enabled = process.env.AUTO_ANTI_DELETE === 'true' || antiDeleteChats.get('global');
+            await sock.sendMessage(msg.key.remoteJid, { text: `📊 Anti-delete is ${enabled ? 'ON' : 'OFF'} (Global)\n\nUse ${config.prefix}antidelete on/off\n\n💡 This is a global setting saved in .env` });
+        }
+    });
+
+    registerCommand('block', 'Block user in DM', async (sock, msg) => {
+        if (Permissions.isGroup(msg.key.remoteJid)) {
+            await sock.sendMessage(msg.key.remoteJid, { text: '❌ This command is only for DMs!' });
+            return;
+        }
+        try {
+            await sock.sendMessage(msg.key.remoteJid, { text: '⛔ Blocking this chat...' });
+            await sock.updateBlockStatus(msg.key.remoteJid, 'block');
+        } catch (error) {
+            await sock.sendMessage(msg.key.remoteJid, { text: `❌ Failed to block: ${error.message}` });
+        }
+    });
+
     registerCommand('autoviewonce', 'Toggle auto-open of view-once media globally', async (sock, msg, args) => {
         const arg = (args[0] || '').toLowerCase();
         if (arg === 'on') {
@@ -985,25 +1094,41 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
                       `*Description:* Set or update environment variables\n\n` +
                       `*Usage:* ${config.prefix}setvar <KEY> <VALUE>\n\n` +
                       `*Common Variables:*\n` +
-                      `• BOT_MODE - Set bot mode (public/private)\n` +
-                      `• PREFIX - Set command prefix\n` +
-                      `• OWNER_NUMBER - Set owner number\n` +
-                      `• BOT_NAME - Set bot name\n` +
-                      `• AUTO_VIEW_ONCE - Auto view-once (true/false)\n\n` +
+                      `• BOT_MODE (alias: mode) - public/private\n` +
+                      `• PREFIX - Command prefix\n` +
+                      `• OWNER_NUMBER (alias: owner) - Owner number\n` +
+                      `• BOT_NAME (alias: name) - Bot name\n` +
+                      `• AUTO_VIEW_ONCE (alias: viewonce) - true/false\n` +
+                      `• AUTO_ANTI_DELETE (alias: antidelete) - true/false\n\n` +
                       `*Examples:*\n` +
-                      `${config.prefix}setvar BOT_MODE private\n` +
+                      `${config.prefix}setvar mode private\n` +
                       `${config.prefix}setvar BOT_MODE public\n` +
-                      `${config.prefix}setvar PREFIX .\n` +
                       `${config.prefix}setvar PREFIX !\n` +
-                      `${config.prefix}setvar OWNER_NUMBER 2349012345678\n` +
-                      `${config.prefix}setvar BOT_NAME MyBot\n\n` +
-                      `⚠️ *Important:* Some changes require bot restart to take effect!`
+                      `${config.prefix}setvar owner 2349012345678\n\n` +
+                      `💡 *Tip:* Use shortcut commands like ${config.prefix}mode, ${config.prefix}prefix instead!`
             });
             return;
         }
 
-        const key = args[0].toUpperCase();
+        let key = args[0].toUpperCase();
         const value = args.slice(1).join(' ');
+
+        // Map common aliases to actual env variable names
+        const keyAliases = {
+            'MODE': 'BOT_MODE',
+            'BOTMODE': 'BOT_MODE',
+            'OWNERNUMBER': 'OWNER_NUMBER',
+            'OWNER': 'OWNER_NUMBER',
+            'BOTNAME': 'BOT_NAME',
+            'NAME': 'BOT_NAME',
+            'AUTOVIEWONCE': 'AUTO_VIEW_ONCE',
+            'VIEWONCE': 'AUTO_VIEW_ONCE'
+        };
+
+        // Use alias mapping if exists
+        if (keyAliases[key]) {
+            key = keyAliases[key];
+        }
 
         // Validate common variables
         if (key === 'BOT_MODE' && !['public', 'private'].includes(value.toLowerCase())) {
@@ -1041,11 +1166,14 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
                           `💡 Change is active immediately!`
                 });
             } else if (key === 'PREFIX') {
+                // Update config for immediate effect
+                config.prefix = value;
                 await sock.sendMessage(msg.key.remoteJid, {
                     text: `✅ *Variable Updated Successfully!*\n\n` +
                           `• Key: ${key}\n` +
                           `• Value: ${value}\n\n` +
-                          `⚠️ *Restart Required:* Please restart the bot for prefix change to take effect`
+                          `💡 *Change is active immediately!*\n` +
+                          `Try it: ${value}ping`
                 });
             } else if (key === 'OWNER_NUMBER') {
                 config.ownerNumber = value;
@@ -1088,6 +1216,235 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             await sock.sendMessage(msg.key.remoteJid, {
                 text: `❌ Failed to update .env file!\n\n` +
                       `Please check file permissions and try again.`
+            });
+        }
+    });
+
+    // Command to view all environment variables
+    registerCommand('seevar', 'View all environment variables', async (sock, msg) => {
+        const autoViewOnce = process.env.AUTO_VIEW_ONCE === 'true';
+
+        const varsText = `╭────────────────────────╮
+│  📊 *ENVIRONMENT VARS*  │
+╰────────────────────────╯
+
+🤖 *Bot Configuration:*
+• Mode: ${config.botMode.toUpperCase()} ${config.botMode === 'private' ? '🔒' : '🌐'}
+• Prefix: ${config.prefix}
+• Name: ${config.botName}
+• Version: ${config.botVersion}
+
+👤 *Owner:*
+• Number: ${config.ownerNumber}
+
+⚙️ *Features:*
+• Auto View-Once: ${autoViewOnce ? 'ON ✅' : 'OFF ❌'}
+
+📝 *Quick Commands:*
+${config.prefix}mode <public|private>
+${config.prefix}prefix <symbol>
+${config.prefix}ownernumber <number>
+${config.prefix}setvar <key> <value>
+
+💡 Use ${config.prefix}help <command> for details`;
+
+        await sock.sendMessage(msg.key.remoteJid, { text: varsText });
+    });
+
+    // Shortcut command for mode
+    registerCommand('mode', 'Change bot mode (public/private)', async (sock, msg, args) => {
+        if (args.length === 0) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `📊 *Current Mode:* ${config.botMode.toUpperCase()}\n\n` +
+                      `*Usage:* ${config.prefix}mode <public|private>\n\n` +
+                      `*Examples:*\n` +
+                      `${config.prefix}mode public\n` +
+                      `${config.prefix}mode private`
+            });
+            return;
+        }
+
+        const mode = args[0].toLowerCase();
+        if (!['public', 'private'].includes(mode)) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Invalid mode!\n\n` +
+                      `Valid modes: public, private\n\n` +
+                      `*Usage:* ${config.prefix}mode <public|private>`
+            });
+            return;
+        }
+
+        const success = updateEnvFile('BOT_MODE', mode);
+        if (success) {
+            config.botMode = mode;
+            process.env.BOT_MODE = mode;
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `✅ *Bot Mode Changed!*\n\n` +
+                      `• New Mode: *${mode.toUpperCase()}*\n\n` +
+                      `${mode === 'private' ? '🔒 Only bot owner can use commands' : '🌐 Everyone can use commands'}\n\n` +
+                      `💡 Change is active immediately!`
+            });
+        } else {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Failed to update mode!`
+            });
+        }
+    });
+
+    // Shortcut command for prefix
+    registerCommand('prefix', 'Change bot command prefix', async (sock, msg, args) => {
+        if (args.length === 0) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `📊 *Current Prefix:* ${config.prefix}\n\n` +
+                      `*Usage:* ${config.prefix}prefix <symbol>\n\n` +
+                      `*Examples:*\n` +
+                      `${config.prefix}prefix .\n` +
+                      `${config.prefix}prefix !\n` +
+                      `${config.prefix}prefix #\n\n` +
+                      `💡 Only symbols allowed`
+            });
+            return;
+        }
+
+        const newPrefix = args[0];
+
+        // Validate that it's a symbol (not alphanumeric)
+        if (/^[a-zA-Z0-9]+$/.test(newPrefix)) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Invalid prefix!\n\n` +
+                      `Prefix must be a symbol (not letters or numbers)\n\n` +
+                      `*Valid examples:* . ! # $ % & * + - / @ ~ \n` +
+                      `*Invalid:* a b c 1 2 3`
+            });
+            return;
+        }
+
+        const oldPrefix = config.prefix;
+        const success = updateEnvFile('PREFIX', newPrefix);
+        if (success) {
+            // Update both config and process.env for immediate effect
+            config.prefix = newPrefix;
+            process.env.PREFIX = newPrefix;
+
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `✅ *Prefix Changed Successfully!*\n\n` +
+                      `• Old Prefix: ${oldPrefix}\n` +
+                      `• New Prefix: ${newPrefix}\n\n` +
+                      `💡 *Change is active immediately!*\n` +
+                      `Try it: ${newPrefix}ping`
+            });
+        } else {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Failed to update prefix!`
+            });
+        }
+    });
+
+    // Shortcut command for owner number
+    registerCommand('ownernumber', 'Set bot owner number', async (sock, msg, args) => {
+        if (args.length === 0) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `📊 *Current Owner:* ${config.ownerNumber}\n\n` +
+                      `*Usage:* ${config.prefix}ownernumber <number>\n\n` +
+                      `*Example:*\n` +
+                      `${config.prefix}ownernumber 2349012345678\n\n` +
+                      `💡 Use country code without + or spaces`
+            });
+            return;
+        }
+
+        const newOwner = args[0].replace(/[^0-9]/g, '');
+        if (!newOwner || newOwner.length < 10) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Invalid phone number!\n\n` +
+                      `*Usage:* ${config.prefix}ownernumber <number>\n` +
+                      `Example: ${config.prefix}ownernumber 2349012345678`
+            });
+            return;
+        }
+
+        const success = updateEnvFile('OWNER_NUMBER', newOwner);
+        if (success) {
+            config.ownerNumber = newOwner;
+            process.env.OWNER_NUMBER = newOwner;
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `✅ *Owner Number Changed!*\n\n` +
+                      `• New Owner: ${newOwner}\n\n` +
+                      `⚠️ *Restart Required:* Please restart the bot for the change to take effect`
+            });
+        } else {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `❌ Failed to update owner number!`
+            });
+        }
+    });
+
+    // Song Download Command
+    registerCommand('songs', 'Search and download songs from YouTube', async (sock, msg, args) => {
+        if (args.length === 0) {
+            await sock.sendMessage(msg.key.remoteJid, {
+                text: `🎵 *SONG DOWNLOADER*\n\n` +
+                      `*Usage:* ${config.prefix}songs <song name>\n\n` +
+                      `*Examples:*\n` +
+                      `${config.prefix}songs smooth criminal by michael jackson\n` +
+                      `${config.prefix}songs shape of you\n` +
+                      `${config.prefix}songs bohemian rhapsody\n\n` +
+                      `💡 After search, reply with a number (1-5) to download`
+            });
+            return;
+        }
+
+        const query = args.join(' ');
+        const chatId = msg.key.remoteJid;
+        const userId = msg.key.participant || msg.key.remoteJid;
+        const storageKey = `${chatId}:${userId}`;
+
+        try {
+            await sock.sendMessage(chatId, {
+                text: `🔍 Searching for: *${query}*\n\n⏳ Please wait...`
+            });
+
+            // Search for songs
+            const results = await searchSongs(query);
+
+            if (!results || results.length === 0) {
+                await sock.sendMessage(chatId, {
+                    text: `❌ No songs found for: *${query}*\n\n💡 Try a different search term`
+                });
+                return;
+            }
+
+            // Store search results for this user
+            console.log('💾 Storing search results:');
+            console.log('  - userId:', userId);
+            console.log('  - query:', query);
+            console.log('  - results count:', results.length);
+
+            songSearchResults.set(storageKey, {
+                results,
+                query,
+                timestamp: Date.now()
+            });
+
+            console.log('✅ Stored! Current searches:', Array.from(songSearchResults.keys()));
+
+            // Format and send results
+            const resultsText = formatSearchResults(results, config.prefix);
+            const sentMsg = await sock.sendMessage(chatId, { text: resultsText });
+            const existing = songSearchResults.get(storageKey) || {};
+            songSearchResults.set(storageKey, {
+                results: existing.results || results,
+                query: existing.query || query,
+                timestamp: existing.timestamp || Date.now(),
+                resultMsgId: sentMsg?.key?.id || existing.resultMsgId
+            });
+
+        } catch (error) {
+            console.error('❌ Song search error:', error);
+            await sock.sendMessage(chatId, {
+                text: `❌ Failed to search for songs!\n\n` +
+                      `Error: ${error.message}\n\n` +
+                      `💡 Please try again later`
             });
         }
     });
@@ -1441,27 +1798,88 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
                 if (!messageStore.has(k)) messageStore.set(k, msg.message);
             } catch {}
 
-            // Auto view-once handler - works for all incoming view-once messages
-            console.log('🔍 Checking for view-once message...');
-            const incomingVOMsg = unwrapViewOnce(msg.message);
-            const autoVOEnabled = process.env.AUTO_VIEW_ONCE === 'true' || autoViewOnceChats.has('global');
-            console.log('🔍 Auto view-once enabled:', autoVOEnabled);
-            console.log('🔍 View-once message found:', !!incomingVOMsg);
+            const isRevoke = !!msg.message.protocolMessage && msg.message.protocolMessage.type === 0;
+            if (isRevoke) {
+                const chatId = msg.key.remoteJid;
+                const enabled = (process.env.AUTO_ANTI_DELETE === 'true') || antiDeleteChats.get('global') || antiDeleteChats.get(chatId);
+                if (enabled) {
+                    try {
+                        const ref = msg.message.protocolMessage.key || {};
+                        const origKey = `${ref.remoteJid || chatId}:${ref.id}`;
+                        const originalMsg = messageStore.get(origKey);
+                        const who = (msg.key.participant || '').split('@')[0];
+                        const label = who ? `♻️ Restored a deleted message by @${who}` : '♻️ Restored a deleted message';
+                        const mentions = msg.key.participant ? [msg.key.participant] : [];
 
-            if (autoVOEnabled && incomingVOMsg) {
-                try {
-                    console.log('🔍 Auto view-once: Detected view-once message');
-                    const buffer = await downloadMediaMessage({ message: incomingVOMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
-                    if (incomingVOMsg.imageMessage) {
-                        console.log('📤 Auto view-once: Sending image...');
-                        await sock.sendMessage(msg.key.remoteJid, { image: buffer, caption: '👀 Auto-opened view-once image' });
-                    } else if (incomingVOMsg.videoMessage) {
-                        console.log('📤 Auto view-once: Sending video...');
-                        await sock.sendMessage(msg.key.remoteJid, { video: buffer, caption: '👀 Auto-opened view-once video' });
+                        if (!originalMsg) {
+                            await sock.sendMessage(chatId, { text: `${label}\n\n[content unavailable]`, mentions });
+                        } else {
+                            let m = originalMsg;
+                            if (m.ephemeralMessage) m = m.ephemeralMessage.message;
+                            let sent = false;
+                            try {
+                                if (m.imageMessage) {
+                                    const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                                    await sock.sendMessage(chatId, { image: buffer, caption: label, mentions });
+                                    sent = true;
+                                } else if (m.videoMessage) {
+                                    const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                                    await sock.sendMessage(chatId, { video: buffer, caption: label, mentions });
+                                    sent = true;
+                                } else if (m.documentMessage) {
+                                    const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                                    await sock.sendMessage(chatId, { document: buffer, mimetype: m.documentMessage.mimetype || 'application/octet-stream', fileName: m.documentMessage.fileName || 'file', caption: label, mentions });
+                                    sent = true;
+                                } else if (m.audioMessage) {
+                                    const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                                    await sock.sendMessage(chatId, { audio: buffer, mimetype: m.audioMessage.mimetype || 'audio/mpeg', ptt: false, fileName: 'audio' }, { quoted: msg });
+                                    await sock.sendMessage(chatId, { text: label, mentions });
+                                    sent = true;
+                                } else if (m.stickerMessage) {
+                                    const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                                    await sock.sendMessage(chatId, { sticker: buffer });
+                                    await sock.sendMessage(chatId, { text: label, mentions });
+                                    sent = true;
+                                }
+                            } catch {}
+                            if (!sent) {
+                                const txt = extractMessageText(originalMsg) || '[no text]';
+                                await sock.sendMessage(chatId, { text: `${label}\n\n${txt}`, mentions });
+                            }
+                        }
+                    } catch (e) {
+                        console.error('❌ Anti-delete error:', e);
                     }
-                    console.log('✅ Auto view-once: Successfully processed');
-                } catch (error) {
-                    console.error('❌ Auto view-once error:', error.message);
+                }
+            }
+
+            // Auto view-once handler - works for all incoming view-once messages
+            const autoVOEnabled = process.env.AUTO_VIEW_ONCE === 'true' || autoViewOnceChats.has('global');
+
+            if (autoVOEnabled) {
+                console.log('🔍 Auto view-once: Checking for view-once message...');
+                const incomingVOMsg = unwrapViewOnce(msg.message);
+                console.log('🔍 Auto view-once: View-once found:', !!incomingVOMsg);
+
+                if (incomingVOMsg) {
+                    try {
+                        console.log('🔍 Auto view-once: Detected view-once message');
+                        console.log('🔍 Auto view-once: Message keys:', Object.keys(incomingVOMsg));
+
+                        const buffer = await downloadMediaMessage({ message: incomingVOMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+
+                        if (incomingVOMsg.imageMessage) {
+                            console.log('📤 Auto view-once: Sending image...');
+                            await sock.sendMessage(msg.key.remoteJid, { image: buffer, caption: '👀 Auto-opened view-once image' });
+                        } else if (incomingVOMsg.videoMessage) {
+                            console.log('📤 Auto view-once: Sending video...');
+                            await sock.sendMessage(msg.key.remoteJid, { video: buffer, caption: '👀 Auto-opened view-once video' });
+                        }
+                        console.log('✅ Auto view-once: Successfully processed');
+                    } catch (error) {
+                        console.error('❌ Auto view-once error:', error);
+                        console.error('Full error:', error.stack);
+                    }
                 }
             }
 
@@ -1509,6 +1927,132 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             console.log('🔍 Prefix:', config.prefix);
             console.log('🔍 Starts with prefix?', messageText.startsWith(config.prefix));
 
+            // Check for song download number reply (before prefix check)
+            const userId = msg.key.participant || msg.key.remoteJid;
+            const chatId = msg.key.remoteJid;
+            const storageKey = `${chatId}:${userId}`;
+            const quotedId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
+
+            // Clean up old searches (older than 1 minute)
+            const now = Date.now();
+            const TTL = 5 * 60 * 1000;
+            for (const [key, data] of songSearchResults.entries()) {
+                if (now - data.timestamp > TTL) {
+                    console.log('🧹 Cleaning up old search for:', key);
+                    songSearchResults.delete(key);
+                }
+            }
+
+            console.log('🎵 Song Reply Check:');
+            console.log('  - userId:', userId);
+            console.log('  - messageText:', messageText);
+            console.log('  - Has pending search?', songSearchResults.has(storageKey));
+            let keyToUse = storageKey;
+            if (!songSearchResults.has(storageKey)) {
+                let latest = null;
+                for (const [k, v] of songSearchResults.entries()) {
+                    if (k.endsWith(`:${userId}`)) {
+                        if (!latest || v.timestamp > latest.timestamp) latest = { k, v };
+                    }
+                }
+                if (latest) {
+                    keyToUse = latest.k;
+                    console.log('  - Using fallback key:', keyToUse);
+                }
+                if (!latest && quotedId) {
+                    for (const [k, v] of songSearchResults.entries()) {
+                        if (k.startsWith(`${chatId}:`) && v.resultMsgId === quotedId) {
+                            keyToUse = k;
+                            console.log('  - Using quoted match key:', keyToUse);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (songSearchResults.has(keyToUse)) {
+                const data = songSearchResults.get(keyToUse);
+                console.log('  - Search timestamp:', new Date(data.timestamp).toISOString());
+                console.log('  - Search age (seconds):', Math.floor((now - data.timestamp) / 1000));
+                console.log('  - Search query:', data.query);
+                console.log('  - Results count:', data.results.length);
+            }
+            console.log('  - All stored searches:', Array.from(songSearchResults.entries()).map(([k, v]) => ({ key: k, query: v.query, age: Math.floor((now - v.timestamp) / 1000) + 's' })));
+
+            if (songSearchResults.has(keyToUse)) {
+                const searchData = songSearchResults.get(keyToUse);
+
+                // Check if search is still valid (less than 1 minute old)
+                if (now - searchData.timestamp > ONE_MINUTE) {
+                    console.log('  ⏰ Search expired, ignoring');
+                    songSearchResults.delete(keyToUse);
+                } else {
+                    const trimmed = messageText.trim();
+                    const match = trimmed.match(/\b([1-9][0-9]*)\b/);
+                    const num = match ? parseInt(match[1]) : NaN;
+
+                    console.log('  ✅ Found valid pending search!');
+                    console.log('  - Trimmed:', trimmed);
+                    console.log('  - Parsed num:', num);
+                    console.log('  - Valid number?', !isNaN(num) && num >= 1 && num <= searchData.results.length);
+
+                    // Check if message is just a number between 1-5
+                    if (!isNaN(num) && num >= 1 && num <= searchData.results.length) {
+                        const selectedSong = searchData.results.find(r => r.number === num);
+
+                    if (selectedSong) {
+                        try {
+                            await sock.sendMessage(chatId, {
+                                text: `📥 *Downloading Song...*\n\n` +
+                                      `🎵 ${selectedSong.title}\n` +
+                                      `👤 ${selectedSong.artist}\n\n` +
+                                      `⏳ This may take a few moments...`
+                            });
+
+                            // Download the song
+                            const fileName = `${selectedSong.title} - ${selectedSong.artist}`;
+                            const filePath = await downloadSong(selectedSong.url, fileName);
+
+                            // Send the audio file
+                            await sock.sendMessage(chatId, {
+                                audio: fs.readFileSync(filePath),
+                                mimetype: 'audio/mpeg',
+                                fileName: `${path.basename(filePath)}`,
+                                ptt: false
+                            }, {
+                                quoted: msg
+                            });
+
+                            await sock.sendMessage(chatId, {
+                                text: `✅ *Download Complete!*\n\n` +
+                                      `🎵 ${selectedSong.title}\n` +
+                                      `👤 ${selectedSong.artist}\n` +
+                                      `⏱️ ${selectedSong.duration}`
+                            });
+
+                            // Clean up the downloaded file
+                            try {
+                                fs.unlinkSync(filePath);
+                            } catch (e) {
+                                console.error('Failed to delete temp file:', e);
+                            }
+
+                            // Clear the search results for this user
+                            songSearchResults.delete(keyToUse);
+
+                        } catch (error) {
+                            console.error('❌ Song download error:', error);
+                            await sock.sendMessage(chatId, {
+                                text: `❌ Failed to download song!\n\n` +
+                                      `Error: ${error.message}\n\n` +
+                                      `💡 Please try searching again with ${config.prefix}songs`
+                            });
+                        }
+                        return; // Don't process as a command
+                    }
+                    }
+                }
+            }
+
             // Check if message starts with prefix
             if (!messageText.startsWith(config.prefix)) {
                 console.log('❌ Message does not start with prefix, ignoring');
@@ -1544,6 +2088,65 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             }
         } catch (error) {
             console.error('❌ Error handling message:', error.message);
+            console.error('Full error:', error.stack);
+            // Don't crash the bot, just log the error
+        }
+    });
+
+    sock.ev.on('messages.update', async (updates) => {
+        try {
+            for (const u of updates) {
+                const proto = u.message?.protocolMessage;
+                if (!proto || proto.type !== 0) continue;
+                const enabled = (process.env.AUTO_ANTI_DELETE === 'true') || antiDeleteChats.get('global');
+                if (!enabled) continue;
+                const chatId = proto.key?.remoteJid || u.key?.remoteJid;
+                const deletedId = proto.key?.id || u.key?.id;
+                if (!chatId || !deletedId) continue;
+                const origKey = `${chatId}:${deletedId}`;
+                const originalMsg = messageStore.get(origKey);
+                const who = (u.key?.participant || '').split('@')[0];
+                const label = who ? `♻️ Restored a deleted message by @${who}` : '♻️ Restored a deleted message';
+                const mentions = u.key?.participant ? [u.key.participant] : [];
+                if (!originalMsg) {
+                    await sock.sendMessage(chatId, { text: `${label}\n\n[content unavailable]`, mentions });
+                    continue;
+                }
+                let m = originalMsg;
+                if (m.ephemeralMessage) m = m.ephemeralMessage.message;
+                let sent = false;
+                try {
+                    if (m.imageMessage) {
+                        const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                        await sock.sendMessage(chatId, { image: buffer, caption: label, mentions });
+                        sent = true;
+                    } else if (m.videoMessage) {
+                        const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                        await sock.sendMessage(chatId, { video: buffer, caption: label, mentions });
+                        sent = true;
+                    } else if (m.documentMessage) {
+                        const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                        await sock.sendMessage(chatId, { document: buffer, mimetype: m.documentMessage.mimetype || 'application/octet-stream', fileName: m.documentMessage.fileName || 'file', caption: label, mentions });
+                        sent = true;
+                    } else if (m.audioMessage) {
+                        const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                        await sock.sendMessage(chatId, { audio: buffer, mimetype: m.audioMessage.mimetype || 'audio/mpeg', ptt: false, fileName: 'audio' });
+                        await sock.sendMessage(chatId, { text: label, mentions });
+                        sent = true;
+                    } else if (m.stickerMessage) {
+                        const buffer = await downloadMediaMessage({ message: originalMsg }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
+                        await sock.sendMessage(chatId, { sticker: buffer });
+                        await sock.sendMessage(chatId, { text: label, mentions });
+                        sent = true;
+                    }
+                } catch {}
+                if (!sent) {
+                    const txt = extractMessageText(originalMsg) || '[no text]';
+                    await sock.sendMessage(chatId, { text: `${label}\n\n${txt}`, mentions });
+                }
+            }
+        } catch (e) {
+            console.error('❌ Anti-delete update error:', e);
         }
     });
 

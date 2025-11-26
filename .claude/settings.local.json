@@ -3,7 +3,9 @@
     "allow": [
       "Bash(dir \"c:\\Users\\fiazzy\\Documents\\fiazzymd\")",
       "Bash(pnpm add:*)",
-      "Bash(node -c:*)"
+      "Bash(node -c:*)",
+      "Bash(pnpm remove:*)",
+      "Bash(where:*)"
     ],
     "deny": [],
     "ask": []
