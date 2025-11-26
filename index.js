@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const { createStickerBuffer } = require('./features/sticker');
 const { enableWelcome, disableWelcome, isWelcomeEnabled, sendWelcomeMessage, sendGoodbyeMessage } = require('./features/welcome');
+const gemini = require('./features/gemini');
 const createPermissions = require('./permissions');
 const { searchSongs, downloadSong, formatSearchResults } = require('./features/songs');
 
@@ -434,6 +435,7 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
 │ ${config.prefix}del
 │ ${config.prefix}sticker
 │ ${config.prefix}welcome (owner/admin only)
+│ ${config.prefix}gemini
 ╰──────────────────────╯
 
 ╭──────────────────────╮
@@ -1156,7 +1158,8 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
             'BOTNAME': 'BOT_NAME',
             'NAME': 'BOT_NAME',
             'AUTOVIEWONCE': 'AUTO_VIEW_ONCE',
-            'VIEWONCE': 'AUTO_VIEW_ONCE'
+            'VIEWONCE': 'AUTO_VIEW_ONCE',
+            'GEMINI': 'GEMINI_API_KEY'
         };
 
         // Use alias mapping if exists
@@ -1237,6 +1240,9 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
                           `• Value: ${value}\n\n` +
                           `💡 Auto view-once is now: *${value.toLowerCase() === 'true' ? 'ON' : 'OFF'}*`
                 });
+            } else if (key === 'GEMINI_API_KEY') {
+                const ok = gemini.initializeGemini();
+                await sock.sendMessage(msg.key.remoteJid, { text: ok ? '✅ Gemini API initialized.' : '⚠️ API set. Restart may be required for stability.' });
             } else {
                 await sock.sendMessage(msg.key.remoteJid, {
                     text: `✅ *Variable Updated Successfully!*\n\n` +
@@ -1702,6 +1708,16 @@ ${config.prefix}setvar <key> <value>
             const secondary = (args[1] || '').toLowerCase();
             if (primary === 'welcome' && secondary === 'set') {
                 const text = `📖 *${config.prefix}welcome set*\n\nSets a custom welcome message for this group.\n\nPlaceholders:\n- @user → mentions the new member (required)\n- {group} → replaced with the group name (optional)\n\nExamples:\n- ${config.prefix}welcome set Welcome to {group}, @user 👋\n- ${config.prefix}welcome set Hello @user — read the rules in the description`;
+                await sock.sendMessage(msg.key.remoteJid, { text });
+                return;
+            }
+            if (primary === 'gemini') {
+                const text = `📖 *${config.prefix}gemini*\n\nChatbot commands:\n- ${config.prefix}gemini on (owner only)\n- ${config.prefix}gemini off (owner only)\n- ${config.prefix}gemini clearchat\n- ${config.prefix}gemini <prompt>\n\nTo set API key (owner only):\n- ${config.prefix}setvar gemini <API_KEY>\n\nNotes:\n- Global toggle applies everywhere\n- Requires GEMINI_API_KEY in .env`;
+                await sock.sendMessage(msg.key.remoteJid, { text });
+                return;
+            }
+            if (primary === 'setvar' && secondary === 'gemini') {
+                const text = `📖 *${config.prefix}setvar gemini <API_KEY>*\n\nSets GEMINI_API_KEY in .env and initializes Gemini.\n\nExample:\n- ${config.prefix}setvar gemini abc123...\n\nOwner only.`;
                 await sock.sendMessage(msg.key.remoteJid, { text });
                 return;
             }
@@ -2256,3 +2272,31 @@ showMenu().catch(err => {
     rl.close();
     process.exit(1);
 });
+    registerCommand('gemini', 'Gemini chatbot on/off/clearchat and prompt', async (sock, msg, args) => {
+        const jid = msg.key.remoteJid;
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'on' || sub === 'off') {
+            const senderNumber = (msg.key.participant || msg.key.remoteJid).split('@')[0];
+            if (senderNumber !== config.ownerNumber) {
+                await sock.sendMessage(jid, { text: '❌ Only the bot owner can toggle Gemini.' });
+                return;
+            }
+            const enable = sub === 'on';
+            const ok = updateEnvFile('GEMINI_ENABLED', enable ? 'true' : 'false');
+            if (ok) {
+                process.env.GEMINI_ENABLED = enable ? 'true' : 'false';
+                await sock.sendMessage(jid, { text: enable ? '✅ Gemini chat is now ON globally.' : '❌ Gemini chat is now OFF globally.' });
+            } else {
+                await sock.sendMessage(jid, { text: '❌ Failed to update .env for global Gemini toggle.' });
+            }
+            return;
+        }
+        if (sub === 'clearchat') { const cleared = gemini.clearChatHistory(jid); await sock.sendMessage(jid, { text: cleared ? '✅ Gemini chat session cleared.' : 'ℹ️ No active chat session found.' }); return; }
+        const prompt = args.join(' ').trim();
+        if (!prompt) { await sock.sendMessage(jid, { text: `💡 Provide a prompt or use ${config.prefix}gemini on/off/clearchat.` }); return; }
+        if (!gemini.isChatEnabled(jid)) { await sock.sendMessage(jid, { text: `❌ Gemini chat is disabled globally. Use ${config.prefix}gemini on to enable.` }); return; }
+        try { await sock.sendPresenceUpdate('composing', jid); } catch {}
+        const response = await gemini.sendMessage(jid, prompt);
+        try { await sock.sendPresenceUpdate('paused', jid); } catch {}
+        await sock.sendMessage(jid, { text: response });
+    });
