@@ -6,6 +6,7 @@ const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 const { createStickerBuffer } = require('./features/sticker');
+const { enableWelcome, disableWelcome, isWelcomeEnabled, sendWelcomeMessage, sendGoodbyeMessage } = require('./features/welcome');
 const createPermissions = require('./permissions');
 const { searchSongs, downloadSong, formatSearchResults } = require('./features/songs');
 
@@ -432,6 +433,7 @@ async function connectToWhatsApp(usePairingCode, sessionPath) {
 │ ${config.prefix}block
 │ ${config.prefix}del
 │ ${config.prefix}sticker
+│ ${config.prefix}welcome (owner/admin only)
 ╰──────────────────────╯
 
 ╭──────────────────────╮
@@ -1019,6 +1021,38 @@ ${config.botMode === 'private' ? '🔒 Private Mode - Owner Only' : '🌐 Public
     registerCommand('s', 'Alias for sticker', async (sock, msg, args) => {
         const handler = commands.get('sticker');
         if (handler) return handler(sock, msg, args);
+    });
+
+    registerCommand('welcome', 'Enable/disable/set welcome messages (group only)', async (sock, msg, args) => {
+        const chatId = msg.key.remoteJid;
+        if (!Permissions.isGroup(chatId)) {
+            await sock.sendMessage(chatId, { text: '❌ This command only works in groups' });
+            return;
+        }
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'on') {
+            enableWelcome(chatId);
+            await sock.sendMessage(chatId, { text: '✅ Welcome system enabled in this group!' });
+        } else if (sub === 'off') {
+            disableWelcome(chatId);
+            await sock.sendMessage(chatId, { text: '❌ Welcome system disabled.' });
+        } else if (sub === 'set') {
+            const text = args.slice(1).join(' ').trim();
+            if (!text) {
+                await sock.sendMessage(chatId, { text: `❌ Provide a message.\n\nCorrect format:\n${config.prefix}welcome set Welcome to {group}, @user 👋` });
+                return;
+            }
+            const { setWelcomeMessage, validateWelcomeTemplate } = require('./features/welcome');
+            const v = validateWelcomeTemplate(text);
+            if (!v.valid) {
+                await sock.sendMessage(chatId, { text: `❌ ${v.reason}\n\nCorrect format:\n${config.prefix}welcome set Welcome to {group}, @user 👋` });
+                return;
+            }
+            setWelcomeMessage(chatId, text);
+            await sock.sendMessage(chatId, { text: '✅ Custom welcome message saved for this group!' });
+        } else {
+            await sock.sendMessage(chatId, { text: `Usage:\n${config.prefix}welcome on\n${config.prefix}welcome off\n${config.prefix}welcome set <message with @user and {group}>` });
+        }
     });
 
     registerCommand('antidelete', 'Toggle anti-delete globally (saved in .env)', async (sock, msg, args) => {
@@ -1664,9 +1698,15 @@ ${config.prefix}setvar <key> <value>
             const helpText = `🤖 *${config.botName} Help*\n\n${commandList}\n\n💡 Use ${config.prefix}help <command> for specific command info`;
             await sock.sendMessage(msg.key.remoteJid, { text: helpText });
         } else {
-            const cmdName = args[0].toLowerCase();
+            const primary = args[0].toLowerCase();
+            const secondary = (args[1] || '').toLowerCase();
+            if (primary === 'welcome' && secondary === 'set') {
+                const text = `📖 *${config.prefix}welcome set*\n\nSets a custom welcome message for this group.\n\nPlaceholders:\n- @user → mentions the new member (required)\n- {group} → replaced with the group name (optional)\n\nExamples:\n- ${config.prefix}welcome set Welcome to {group}, @user 👋\n- ${config.prefix}welcome set Hello @user — read the rules in the description`;
+                await sock.sendMessage(msg.key.remoteJid, { text });
+                return;
+            }
+            const cmdName = primary;
             const cmd = commands.get(cmdName);
-
             if (cmd) {
                 await sock.sendMessage(msg.key.remoteJid, {
                     text: `📖 *Command: ${config.prefix}${cmdName}*\n\n${cmd.description}`
@@ -2090,6 +2130,24 @@ ${config.prefix}setvar <key> <value>
             console.error('❌ Error handling message:', error.message);
             console.error('Full error:', error.stack);
             // Don't crash the bot, just log the error
+        }
+    });
+
+    sock.ev.on('group-participants.update', async (update) => {
+        try {
+            const { id, participants, action } = update;
+            if (!isWelcomeEnabled(id)) return;
+            if (action === 'add') {
+                for (const user of participants || []) {
+                    await sendWelcomeMessage(sock, id, user);
+                }
+            } else if (action === 'remove' || action === 'leave') {
+                for (const user of participants || []) {
+                    await sendGoodbyeMessage(sock, id, user);
+                }
+            }
+        } catch (e) {
+            console.error('❌ Welcome handler error:', e);
         }
     });
 
